@@ -7,10 +7,12 @@ namespace App\BasketTest\Model;
 use App\Basket\Model\Basket\Basket;
 use App\Basket\Model\Basket\BasketId;
 use App\Basket\Model\Basket\ShoppingSession;
+use App\Basket\Model\ERP\ERP;
 use App\Basket\Model\ERP\ProductId;
+use App\Basket\Model\ERP\ProductStock;
 use App\Basket\Model\Event\ProductAddedToBasket;
 use App\Basket\Model\Event\ShoppingSessionStarted;
-use App\Basket\Model\Exception\ProductAddedTwice;
+use App\Basket\Model\Exception\UnknownProduct;
 use App\BasketTest\TestCase;
 use Prooph\EventSourcing\AggregateChanged;
 use Ramsey\Uuid\Uuid;
@@ -71,7 +73,7 @@ class BasketTest extends TestCase
             $this->shoppingSessionStarted()
         );
 
-        $basket->addProduct($this->product1);
+        $basket->addProduct($this->product1, $this->product1ERP());
 
         /** @var AggregateChanged[] $events */
         $events = $this->popRecordedEvents($basket);
@@ -84,22 +86,89 @@ class BasketTest extends TestCase
         $this->assertSame(ProductAddedToBasket::class, $event->messageName());
         $this->assertTrue($this->basketId->equals($event->basketId()));
         $this->assertTrue($this->product1->equals($event->productId()));
+        $this->assertSame(5, $event->payload()['stock_quantity']);
+        $this->assertSame(1, $event->payload()['stock_version']);
+        $this->assertSame(1, $event->payload()['quantity']);
     }
 
     /**
      * @test
+     * @expectedException \App\Basket\Model\Exception\ProductAddedTwice
      */
     public function it_throws_exception_if_product_is_added_twice()
     {
-        $this->expectException(ProductAddedTwice::class);
-
         $basket = $this->reconstituteBasketFromHistory(
             $this->shoppingSessionStarted(),
             $this->product1Added()
         );
 
         //Add same product again
-        $basket->addProduct($this->product1);
+        $basket->addProduct($this->product1, $this->product1ERP());
+    }
+
+    /**
+     * @test
+     * @expectedException \App\Basket\Model\Exception\UnknownProduct
+     */
+    public function it_stops_operation_if_product_is_unknown()
+    {
+        $basket = $this->reconstituteBasketFromHistory(
+            $this->shoppingSessionStarted()
+        );
+
+        $erp = $this->prophesize(ERP::class);
+
+        //This ERP mock knows no product
+        $erp->getProductStock($this->product1)->willThrow(UnknownProduct::withProductId($this->product1));
+
+        $basket->addProduct($this->product1, $erp->reveal());
+    }
+
+    /**
+     * @test
+     */
+    public function it_adds_product_without_stock_info_if_ERP_is_unavailable()
+    {
+        $basket = $this->reconstituteBasketFromHistory(
+            $this->shoppingSessionStarted()
+        );
+
+        $erp = $this->prophesize(ERP::class);
+
+        //This ERP is unavailable
+        $erp->getProductStock($this->product1)->willReturn(null);
+
+        $basket->addProduct($this->product1, $erp->reveal());
+
+        /** @var AggregateChanged[] $events */
+        $events = $this->popRecordedEvents($basket);
+
+        $this->assertCount(1, $events);
+
+        /** @var ProductAddedToBasket $event */
+        $event = $events[0];
+
+        $this->assertSame(ProductAddedToBasket::class, $event->messageName());
+        $this->assertTrue($this->basketId->equals($event->basketId()));
+        $this->assertTrue($this->product1->equals($event->productId()));
+        $this->assertSame(1, $event->payload()['quantity']);
+        //No stock info present
+        $this->assertSame(null, $event->payload()['stock_quantity']);
+        $this->assertSame(null, $event->payload()['stock_version']);
+    }
+
+    /**
+     * @test
+     * @expectedException \App\Basket\Model\Exception\ProductOutOfStock
+     */
+    public function it_does_not_add_product_if_product_is_out_of_stock()
+    {
+        $basket = $this->reconstituteBasketFromHistory(
+            $this->shoppingSessionStarted()
+        );
+
+        //Set stock quantity to zero in the ERP mock
+        $basket->addProduct($this->product1, $this->product1ERP(0));
     }
 
     /**
@@ -109,9 +178,10 @@ class BasketTest extends TestCase
      * because type hint for reconstituteAggregateFromHistory() is only AggregateRoot
      *
      * @param AggregateChanged[] ...$events
+     *
      * @return Basket
      */
-    private function reconstituteBasketFromHistory(AggregateChanged ...$events): Basket
+    private function reconstituteBasketFromHistory(AggregateChanged ...$events) : Basket
     {
         return $this->reconstituteAggregateFromHistory(
             Basket::class,
@@ -127,11 +197,14 @@ class BasketTest extends TestCase
      *
      * @return ShoppingSessionStarted
      */
-    private function shoppingSessionStarted(): ShoppingSessionStarted
+    private function shoppingSessionStarted() : ShoppingSessionStarted
     {
-        return ShoppingSessionStarted::occur($this->basketId->toString(), [
-            'shopping_session' => $this->shoppingSession->toString()
-        ]);
+        return ShoppingSessionStarted::occur(
+            $this->basketId->toString(),
+            [
+                'shopping_session' => $this->shoppingSession->toString(),
+            ]
+        );
     }
 
     /**
@@ -142,10 +215,32 @@ class BasketTest extends TestCase
      *
      * @return ProductAddedToBasket
      */
-    private function product1Added(): ProductAddedToBasket
+    private function product1Added() : ProductAddedToBasket
     {
-        return ProductAddedToBasket::occur($this->basketId->toString(), [
-            'product_id' => $this->product1->toString()
-        ]);
+        return ProductAddedToBasket::occur(
+            $this->basketId->toString(),
+            [
+                'product_id' => $this->product1->toString(),
+                'stock_quantity' => 5,
+                'stock_version' => 1,
+                'quantity' => 1,
+            ]
+        );
+    }
+
+    private function product1ERP(int $stockQuantity = 5): ERP
+    {
+        //Create a Mock of the ERP interface
+        $erp = $this->prophesize(ERP::class);
+
+        $erp->getProductStock($this->product1)->willReturn(ProductStock::fromArray(
+            [
+                'product_id' => $this->product1->toString(),
+                'quantity' => $stockQuantity,
+                'version' => 1
+            ]
+        ));
+
+        return $erp->reveal();
     }
 }

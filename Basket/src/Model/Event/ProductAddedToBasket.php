@@ -18,8 +18,23 @@ class ProductAddedToBasket extends AggregateChanged
         return BasketId::fromString($this->aggregateId());
     }
 
-    public function productId(): ProductId
+    public function productId() : ProductId
     {
         return ProductId::fromString($this->payload()['product_id']);
+    }
+
+    public function stockQuantity() : ?int
+    {
+        return $this->payload()['stock_quantity'];
+    }
+
+    public function stockVersion() : ?int
+    {
+        return $this->payload()['stock_version'];
+    }
+
+    public function quantity() : int
+    {
+        return $this->payload()['quantity'];
     }
 }
